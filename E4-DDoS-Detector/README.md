@@ -30,7 +30,7 @@ Unlike traditional implementations that require a user-space daemon (e.g., writt
 
 ## 2. Code Architecture & Data Structures
 
-All packet processing logic lives in a single C file (`program.c`), compiled into eBPF bytecode and injected directly into the Linux kernel. Below is a detailed breakdown of every key component.
+All packet processing logic lives in a single C file (`program.bpf.c`), compiled into eBPF bytecode and injected directly into the Linux kernel. Below is a detailed breakdown of every key component.
 
 ### 2.1 The Statistics Structure
 
@@ -117,7 +117,7 @@ if (stats) {
     }
 } else {
     // First packet from this IP — initialize its entry
-    bpf_printk("--- eBPF DETECTOR START! First packet captured! ---\n");
+    bpf_printk("--- eBPF DETECTOR START! Pierwszy pakiet zlapany! ---\n");
     struct packet_stats new_stats = {1, now};
     bpf_map_update_elem(&ip_counters, &saddr, &new_stats, BPF_ANY);
 }
@@ -146,11 +146,10 @@ At the Basic Level, the filter operates as a pure **IDS (Intrusion Detection Sys
 
 ```
 E4-DDoS-Detector/
-├── program.c    # eBPF/XDP kernel-space detector (C) — the only source file
-└── README.md    # This documentation file
+├── program.bpf.c  # eBPF/XDP kernel-space detector (C) — the only source file
+├── Makefile       # Single-rule build script (clang invocation)
+└── README.md      # This documentation file
 ```
-
-There is intentionally no user-space daemon, no Go files, and no build system. The only compilation step is a single `clang` command (see Section 5).
 
 ---
 
@@ -196,9 +195,10 @@ cd kernel-playground/E4-DDoS-Detector
 Compile the C source file into an eBPF object file using Clang:
 
 ```bash
-clang -O2 -g -target bpf -c program.bpf.c -o program.o
+clang -O2 -g -target bpf -c program.bpf.c -o program.bpf.o
 ```
-or make command that from Makefile that this repository contains
+
+Or use the provided Makefile:
 
 ```bash
 make
@@ -211,7 +211,7 @@ make
 | `-target bpf` | Cross-compile to the BPF virtual machine architecture |
 | `-c` | Compile only, do not link |
 
-This produces `program.o` — the compiled eBPF bytecode ready to be injected into the kernel.
+This produces `program.bpf.o` — the compiled eBPF bytecode ready to be injected into the kernel.
 
 ---
 
@@ -227,7 +227,7 @@ sudo ip link set dev lo xdpgeneric obj program.bpf.o sec xdp
 |---|---|
 | `dev lo` | Attach to the loopback interface — safe for testing, no physical hardware involved |
 | `xdpgeneric` | Software-mode XDP driver: works on any interface including virtual ones; hardware-independent |
-| `obj program.o` | The compiled eBPF bytecode file to load |
+| `obj program.bpf.o` | The compiled eBPF bytecode file to load |
 | `sec xdp` | Select the ELF section named `"xdp"` from the object file (matches `SEC("xdp")` in the C code) |
 
 A silent return (no output) means success. The detector is now active inside the kernel and inspecting every packet on `lo`.
@@ -264,7 +264,7 @@ Open a **completely new** terminal window. Simulate a high-volume ping flood dir
 sudo ping -f 127.0.0.1
 ```
 
-Let it run for 3–4 seconds, then stop it with `Ctrl+C`. The `-f` (flood) flag sends packets as fast as possible — during testing this generated approximately **55,000–172,000 packets per second**.
+Let it run for 3–4 seconds, then stop it with `Ctrl+C`. The `-f` (flood) flag sends packets as fast as possible — actual throughput varies depending on the machine; during testing approximately **32,000–35,000 packets per second** were observed.
 
 ### Step 3: Observe the Outcome
 
@@ -273,14 +273,15 @@ Switch back to **Terminal 1**. You will see:
 1. An initialization message printed when the very first packet from a new IP is seen:
 
 ```
-<...>-XXXX [001] ..s21  TIMESTAMP: bpf_trace_printk: --- eBPF DETECTOR START! First packet captured! ---
+ping-4275  [001] ..s21  894.519155: bpf_trace_printk: --- eBPF DETECTOR START! Pierwszy pakiet zlapany! ---
 ```
 
 2. A high-volume alarm printed every second the threshold is exceeded:
 
 ```
-<...>-XXXX [001] ..s21  TIMESTAMP: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 55850
-<...>-XXXX [001] ..s21  TIMESTAMP: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 61200
+ping-4275  [001] ..s21  895.519094: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 35404
+ping-4275  [000] ..s21  896.519176: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 33148
+ping-4275  [002] ..s21  897.520085: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 33610
 ```
 
 ### Step 4: Cleanup
