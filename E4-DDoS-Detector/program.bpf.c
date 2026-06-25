@@ -22,32 +22,38 @@ int detect_flood(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
 
+    // 1. Parse Ethernet header
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
 
+    // 2. Parse IPv4 header
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
 
     __u32 saddr = ip->saddr;
     __u64 now = bpf_ktime_get_ns();
     
+    // 3. Lookup stats for this source IP
     struct packet_stats *stats = bpf_map_lookup_elem(&ip_counters, &saddr);
     
     if (stats) {
         __u64 delta = now - stats->window_start_ns;
+        // Check if the 1-second window has passed (1,000,000,000 nanoseconds)
         if (delta >= 1000000000ULL) {
             if (stats->count >= 100) {
                 bpf_printk("[ALARM] DDoS detected! Packets in last sec: %llu\n", stats->count);
             }
+            // Reset the counter for the new time window
             stats->count = 1;
             stats->window_start_ns = now;
         } else {
+            // Still within the same 1-second window
             stats->count += 1;
         }
     } else {
-        // SYGNAŁ ŻYCIA - ten tekst pojawi się przy pierwszym pingu!
-        bpf_printk("--- eBPF DETECTOR START! Pierwszy pakiet zlapany! ---\n");
+        // LIFESIGN - Log on the very first packet from a new source IP
+        bpf_printk("--- eBPF DETECTOR START! First packet captured! ---\n");
         struct packet_stats new_stats = {1, now};
         bpf_map_update_elem(&ip_counters, &saddr, &new_stats, BPF_ANY);
     }
