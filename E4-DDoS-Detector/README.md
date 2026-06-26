@@ -51,14 +51,14 @@ eBPF programs are stateless — they have no memory between individual packet in
 
 ```c
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 1024);
     __type(key, __u32);                  // Key:   Source IPv4 address (4 bytes)
     __type(value, struct packet_stats);  // Value: The stats struct above
 } ip_counters SEC(".maps");
 ```
 
-**Why `BPF_MAP_TYPE_HASH`?** It provides O(1) average-case lookups by source IP address. Up to 1024 unique IPs can be tracked simultaneously. Each source IP is tracked independently, so simultaneous traffic from multiple hosts is handled correctly.
+**Why `BPF_MAP_TYPE_LRU_HASH`?** Unlike a plain `BPF_MAP_TYPE_HASH`, the LRU (Least Recently Used) variant automatically evicts the least recently accessed entry when the map reaches capacity. This protects against memory exhaustion during an attack that spoofs a large number of unique source IPs — up to 1024 entries are tracked simultaneously, and the kernel handles eviction automatically without any additional code. Each source IP is still tracked independently, so simultaneous traffic from multiple hosts is handled correctly.
 
 ### 2.3 The XDP Entry Point
 
@@ -105,19 +105,23 @@ if (stats) {
     __u64 delta = now - stats->window_start_ns;
 
     if (delta >= 1000000000ULL) {          // 1,000,000,000 ns = 1 second
-        if (stats->count >= 100) {
-            bpf_printk("[ALARM] DDoS detected! Packets in last sec: %llu\n",
-                       stats->count);
-        }
-        // Reset: start a fresh window
+        // A second has passed — reset the window for this IP
         stats->count = 1;
         stats->window_start_ns = now;
     } else {
-        stats->count += 1;                 // Still within the same second
+        // Still within the same time window (under 1 second)
+        stats->count += 1;
+
+        // The alarm triggers immediately upon strictly exceeding 100 pps.
+        // Using == 101 ensures the log is printed only once per time window,
+        // protecting the trace pipe from being flooded with millions of entries.
+        if (stats->count == 101) {
+            bpf_printk("[ALARM] DDoS detected! IP strictly exceeded 100 pps.\n");
+        }
     }
 } else {
-    // First packet from this IP — initialize its entry
-    bpf_printk("--- eBPF DETECTOR START! Pierwszy pakiet zlapany! ---\n");
+    // First contact with this IP address — initialize its entry
+    bpf_printk("--- eBPF DETECTOR START! First packet captured! ---\n");
     struct packet_stats new_stats = {1, now};
     bpf_map_update_elem(&ip_counters, &saddr, &new_stats, BPF_ANY);
 }
@@ -128,11 +132,20 @@ if (stats) {
 | Decision | Rationale |
 |---|---|
 | `bpf_ktime_get_ns()` for timekeeping | Runs entirely inside the kernel; zero user-space overhead |
+| `BPF_MAP_TYPE_LRU_HASH` for the map | Automatically evicts stale entries; protects against IP-spoofing exhaustion attacks |
 | 1-second sliding window per source IP | Matches the project spec of ">100 pps" |
+| Alarm fires at `count == 101` | Triggers exactly once per window at the moment the threshold is crossed; avoids log spam |
 | `bpf_printk()` for alerting | Writes to the kernel trace pipe — observable without any daemon |
 | `BPF_ANY` flag on map update | Creates a new entry if the key is absent, or overwrites if present |
 
-### 2.6 Return Code
+### 2.6 Alarm Behaviour
+
+The alarm design was changed from the naive approach to avoid overwhelming the kernel trace pipe:
+
+- **Old approach:** the alarm was evaluated at window rollover — meaning it could only fire once per second at most, but the packet count for the previous window was logged every time, producing one noisy log line per second per offending IP.
+- **New approach:** the alarm fires **immediately** the moment `count` reaches 101 within a window (`count == 101`). Since the counter is never reset mid-window, this condition is hit **at most once per 1-second window** per source IP. The log line confirms the threshold was exceeded without printing the raw packet count, keeping the trace pipe clean.
+
+### 2.7 Return Code
 
 ```c
 return XDP_PASS;
@@ -273,16 +286,16 @@ Switch back to **Terminal 1**. You will see:
 1. An initialization message printed when the very first packet from a new IP is seen:
 
 ```
-ping-4275  [001] ..s21  894.519155: bpf_trace_printk: --- eBPF DETECTOR START! Pierwszy pakiet zlapany! ---
+ping-4275  [001] ..s21  894.519155: bpf_trace_printk: --- eBPF DETECTOR START! First packet captured! ---
 ```
 
-2. A high-volume alarm printed every second the threshold is exceeded:
+2. A single alarm line printed **once per 1-second window** the moment the 101st packet is received within that window:
 
 ```
-ping-4275  [001] ..s21  895.519094: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 35404
-ping-4275  [000] ..s21  896.519176: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 33148
-ping-4275  [002] ..s21  897.520085: bpf_trace_printk: [ALARM] DDoS detected! Packets in last sec: 33610
+ping-4275  [001] ..s21  894.519301: bpf_trace_printk: [ALARM] DDoS detected! IP strictly exceeded 100 pps.
 ```
+
+Unlike the previous implementation, the alarm fires immediately at the moment the threshold is crossed (at packet #101) rather than at the end of the window. It is printed exactly once per window per source IP, regardless of how many subsequent packets arrive in that same second — this keeps the trace pipe readable even under extreme flood conditions.
 
 ### Step 4: Cleanup
 
